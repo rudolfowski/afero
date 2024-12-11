@@ -1,0 +1,6 @@
+{
+  "endpoint": "http://127.0.0.1:9000",
+  "region": "us-east-1",
+  "accessKeyId": "test_user",
+  "secretAccessKey": "yb062gMpbkhrw"
+}
