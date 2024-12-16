@@ -3,11 +3,14 @@ package s3fs
 import (
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/spf13/afero"
 	"io"
 	"os"
+	"sort"
 	"sync"
+	"syscall"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/spf13/afero"
 )
 
 var (
@@ -148,7 +151,6 @@ func (f *S3File) WriteAt(p []byte, off int64) (int, error) {
 		n, err := f.writer.Write(p)
 		f.offset += int64(n)
 		return n, err
-
 	}
 
 	// if readers are open, close them
@@ -225,18 +227,71 @@ func (f *S3File) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *S3File) Name() string {
-	//TODO implement me
-	panic("implement me")
+	return f.name
 }
 
 func (f *S3File) Readdir(count int) ([]os.FileInfo, error) {
-	//TODO implement me
-	panic("implement me")
+	// we sync file before getting the file info
+	err := f.Sync()
+	if err != nil {
+		return nil, err
+	}
+
+	// we get the file info
+	// to check if the file is a directory
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	if !fi.IsDir() {
+		return nil, syscall.ENOTDIR
+	}
+
+	name := EnsureTrailingSeparator(f.name, f.fs.separator)
+	attrs, err := f.fs.getObjectsAttrs(name)
+	if err != nil {
+		return nil, err
+	}
+
+	var res []os.FileInfo
+	var fileInfos []*FileInfo
+
+	// if there are no objects in the directory
+	if len(attrs) == 0 {
+		return res, io.EOF
+	}
+
+	for _, attr  := range attrs {
+		fileInfos = append(fileInfos, newFileInfoFromAttrs(attr, f.fs, DefaultFileMode))
+	}
+
+	// sort the file infos by name
+	sort.Sort(ByName(fileInfos))
+
+	if count > 0 {
+		fileInfos = fileInfos[:count]
+	}
+
+	for _, f := range fileInfos {
+		res = append(res, f)
+	}
+
+	return res, nil
 }
 
 func (f *S3File) Readdirnames(n int) ([]string, error) {
-	//TODO implement me
-	panic("implement me")
+	fi, err := f.Readdir(n)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	names := make([]string, len(fi))
+	for i, f := range fi {
+		names[i] = f.Name()
+	}
+
+	return names, err
 }
 
 func (f *S3File) Stat() (os.FileInfo, error) {
@@ -258,8 +313,7 @@ func (f *S3File) Truncate(size int64) error {
 }
 
 func (f *S3File) WriteString(s string) (ret int, err error) {
-	//TODO implement me
-	panic("implement me")
+	return f.Write([]byte(s))
 }
 
 func (f *S3File) closeIo() error {

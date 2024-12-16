@@ -3,22 +3,34 @@ package s3fs
 import (
 	"context"
 	"errors"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/spf13/afero"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/spf13/afero"
 )
 
 var (
-	ErrFilenameEmpty = errors.New("filename is empty")
+	ErrorNoBucketName = errors.New("no bucket name")
+	ErrFilenameEmpty  = errors.New("filename is empty")
+	ErrEmptyObjectKey = errors.New("input member Key must not be empty")
+	ErrDirExists      = errors.New("directory already exists")
 )
+
+type ObjectAttrs struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+	Prefix       string
+}
 
 type fs struct {
 	ctx      context.Context
@@ -27,6 +39,7 @@ type fs struct {
 	log      *slog.Logger
 
 	separator string
+	limit     int32
 }
 
 func newFs(ctx context.Context, client *s3.Client) *fs {
@@ -36,7 +49,79 @@ func newFs(ctx context.Context, client *s3.Client) *fs {
 		client:    client,
 		uploader:  manager.NewUploader(client),
 		separator: "/",
+		limit:     1000,
 	}
+}
+
+// S3 don't have a concept of directories
+// so we have to create a virtual directory
+// by creating an empty object with a trailing separator
+func (f *fs) Mkdir(name string, perm os.FileMode) error {
+	name, err := f.parseName(name)
+	if err != nil {
+		return err
+	}
+
+	bucketName, key := SplitName(name, f.separator)
+	if bucketName == "" {
+		return ErrorNoBucketName
+	}
+
+	if key == "" {
+		return ErrEmptyObjectKey
+	}
+
+	// we have to ensure dir name ends with separator
+	// so we can create virtual directory
+	key = EnsureTrailingSeparator(key, f.separator)
+
+	_, err = f.client.PutObject(f.ctx, &s3.PutObjectInput{
+		Bucket: &bucketName,
+		Key:    &key,
+		Body:   strings.NewReader(""),
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (f *fs) MkdirAll(path string, perm os.FileMode) error {
+	path, err := f.parseName(path)
+	if err != nil {
+		return err
+	}
+
+	bucketName, key := SplitName(path, f.separator)
+	if bucketName == "" {
+		return ErrorNoBucketName
+	}
+
+	if key == "" {
+		return ErrEmptyObjectKey
+	}
+
+	folderName := ""
+	folders := strings.Split(path, f.separator)
+
+	for i, folder := range folders {
+		// If first element we it as the bucket name and continue
+		if i == 0 {
+			folderName = folder
+			continue
+		} else if folder == "" {
+			continue
+		} else {
+			folderName = folderName + f.separator + folder
+		}
+
+		if err := f.Mkdir(folderName, perm); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (f *fs) Create(name string) (*S3File, error) {
@@ -122,7 +207,6 @@ func (f *fs) Remove(name string) error {
 	name, err := f.parseName(name)
 	if err != nil {
 		return err
-
 	}
 
 	fi, err := f.Stat(name)
@@ -131,7 +215,22 @@ func (f *fs) Remove(name string) error {
 	}
 
 	if fi.IsDir() {
+		// if it's a directory we have to check if it's empty
+		dir, err := f.Open(name)
+		if err != nil {
+			return err
+		}
 
+		infos, err := dir.Readdir(-1)
+		if err != nil {
+			return err
+		}
+
+		if len(infos) > 0 {
+			return syscall.ENOTEMPTY
+		}
+
+		name = EnsureTrailingSeparator(name, f.separator)
 	}
 
 	return f.deleteObject(name)
@@ -142,6 +241,11 @@ func (f *fs) Rename(oldname, newname string) error {
 }
 
 func (f *fs) Stat(name string) (os.FileInfo, error) {
+	name, err := f.parseName(name)
+	if err != nil {
+		return nil, err
+	}
+
 	return newFileInfo(name, f, DefaultFileMode)
 }
 
@@ -158,6 +262,10 @@ func (f *fs) getObj(name string) (*s3.HeadObjectOutput, error) {
 	_, err := f.getBucket(bucketName)
 	if err != nil {
 		return nil, err
+	}
+
+	if key == "" {
+		return nil, ErrEmptyObjectKey
 	}
 
 	out, err := f.client.HeadObject(f.ctx, &s3.HeadObjectInput{
@@ -235,4 +343,72 @@ func (f *fs) isObjectExist(name string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func (f *fs) checkIfDirExists(name string) (bool, error) {
+	bucketName, key := SplitName(name, f.separator)
+	params := &s3.ListObjectsV2Input{
+		Bucket:    aws.String(bucketName),
+		Prefix:    aws.String(key),
+		Delimiter: aws.String(f.separator),
+	}
+
+	p := s3.NewListObjectsV2Paginator(f.client, params, func(o *s3.ListObjectsV2PaginatorOptions) {
+		o.Limit = 2
+	})
+
+	for p.HasMorePages() {
+		page, err := p.NextPage(f.ctx)
+		if err != nil {
+			return false, err
+		}
+
+		// Check if common prefixes exist
+		// if yes we have dictionary
+		if len(page.CommonPrefixes) > 0 {
+			return true, nil
+		}
+
+	}
+
+	return false, nil
+}
+
+func (f *fs) getObjectsAttrs(name string) ([]ObjectAttrs, error) {
+	bucketName, key := SplitName(name, f.separator)
+	params := &s3.ListObjectsV2Input{
+		Bucket:    aws.String(bucketName),
+		Prefix:    aws.String(key),
+		Delimiter: aws.String(f.separator),
+	}
+
+	p := s3.NewListObjectsV2Paginator(f.client, params, func(o *s3.ListObjectsV2PaginatorOptions) {
+		o.Limit = f.limit
+	})
+
+	var objects []ObjectAttrs
+	for p.HasMorePages() {
+		page, err := p.NextPage(f.ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		dirs := page.CommonPrefixes
+		for _, dir := range dirs {
+			objects = append(objects, ObjectAttrs{
+				Key:    *dir.Prefix,
+				Prefix: *dir.Prefix,
+			})
+		}
+
+		for _, obj := range page.Contents {
+			objects = append(objects, ObjectAttrs{
+				Key:          *obj.Key,
+				Size:         *obj.Size,
+				LastModified: *obj.LastModified,
+			})
+		}
+	}
+
+	return objects, nil
 }

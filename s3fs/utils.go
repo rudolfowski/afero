@@ -26,3 +26,10 @@ func SplitName(name string, separator string) (string, string) {
 
 	return splitName[0], strings.Join(splitName[1:], separator)
 }
+
+func EnsureTrailingSeparator(s string, separator string) string {
+	if len(s) > 0 && !strings.HasSuffix(s, separator) {
+		return s + separator
+	}
+	return s
+}

@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/spf13/afero"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/spf13/afero"
 )
 
 const (
@@ -49,6 +51,7 @@ var dirs = []struct {
 	{"/testDir1", []string{"testFile"}},
 }
 var s3Afs *afero.Afero
+var s3Fs *S3Fs
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -57,7 +60,9 @@ func TestMain(m *testing.M) {
 
 	// in order to respect deferring
 	var exitCode int
-	defer os.Exit(exitCode)
+	defer func() {
+		os.Exit(exitCode)
+	}()
 
 	defer func() {
 		err := recover()
@@ -76,7 +81,7 @@ func TestMain(m *testing.M) {
 		}
 	}()
 
-	s3Fs, err := NewS3FS(ctx)
+	s3Fs, err = NewS3FS(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -87,9 +92,118 @@ func TestMain(m *testing.M) {
 
 }
 
-func TestS3Fs_Open(t *testing.T) {
+func Test_Open(t *testing.T) {
 	createFiles(t)
 	defer removeFiles(t)
+
+	for _, f := range files {
+		nameBase := filepath.Join(bucketName, f.name)
+		names := []string{
+			nameBase,
+			string(os.PathSeparator) + nameBase,
+		}
+		if f.name == "" {
+			names = []string{f.name}
+		}
+
+		for _, name := range names {
+			file, err := s3Afs.Open(name)
+			if (err == nil) != f.exists {
+				t.Errorf("%v exists = %v, but got err = %v", name, f.exists, err)
+			}
+
+			if !f.exists {
+				continue
+			}
+			if err != nil {
+				t.Fatalf("%v: %v", name, err)
+			}
+
+			if file.Name() != filepath.FromSlash(nameBase) {
+				t.Errorf("Name(), got %v, expected %v", file.Name(), filepath.FromSlash(nameBase))
+			}
+
+			s, err := file.Stat()
+			if err != nil {
+				t.Fatalf("stat %v: got error '%v'", file.Name(), err)
+			}
+
+			if isdir := s.IsDir(); isdir != f.isdir {
+				t.Errorf("%v directory, got: %v, expected: %v", file.Name(), isdir, f.isdir)
+			}
+
+			if size := s.Size(); size != f.size {
+				t.Errorf("%v size, got: %v, expected: %v", file.Name(), size, f.size)
+			}
+		}
+	}
+}
+
+func Test_Readdir(t *testing.T) {
+	createFiles(t)
+	defer removeFiles(t)
+
+	for _, d := range dirs {
+		nameBase := filepath.Join(bucketName, d.name)
+
+		names := []string{
+			nameBase,
+			string(os.PathSeparator) + nameBase,
+		}
+
+		for _, name := range names {
+			dir, err := s3Afs.Open(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			fi, err := dir.Readdir(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fileNames []string
+			for _, f := range fi {
+				fileNames = append(fileNames, f.Name())
+			}
+
+			if !reflect.DeepEqual(fileNames, d.children) {
+				t.Errorf("%v: children, got '%v', expected '%v'", name, fileNames, d.children)
+			}
+
+			fi, err = dir.Readdir(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			fileNames = []string{}
+			for _, f := range fi {
+				fileNames = append(fileNames, f.Name())
+			}
+
+			if !reflect.DeepEqual(fileNames, d.children[0:1]) {
+				t.Errorf("%v: children, got '%v', expected '%v'", name, fileNames, d.children[0:1])
+			}
+		}
+	}
+
+	nameBase := filepath.Join(bucketName, "testFile")
+
+	names := []string{
+		nameBase,
+		string(os.PathSeparator) + nameBase,
+	}
+
+	for _, name := range names {
+		dir, err := s3Fs.Open(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = dir.Readdir(-1)
+		if err != syscall.ENOTDIR {
+			t.Fatal("Expected error")
+		}
+	}
 }
 
 func createFiles(t *testing.T) {

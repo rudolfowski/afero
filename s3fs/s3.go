@@ -2,12 +2,13 @@ package s3fs
 
 import (
 	"context"
+	"os"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/afero"
-	"os"
-	"time"
 )
 
 var _ afero.Fs = (*S3Fs)(nil)
@@ -52,18 +53,15 @@ func (s S3Fs) Create(name string) (afero.File, error) {
 }
 
 func (s S3Fs) Mkdir(name string, perm os.FileMode) error {
-	//TODO implement me
-	panic("implement me")
+	return s.source.Mkdir(name, perm)
 }
 
 func (s S3Fs) MkdirAll(path string, perm os.FileMode) error {
-	//TODO implement me
-	panic("implement me")
+	return s.source.MkdirAll(path, perm)
 }
 
 func (s S3Fs) Open(name string) (afero.File, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.source.Open(name)
 }
 
 func (s S3Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
@@ -86,8 +84,7 @@ func (s S3Fs) Rename(oldname, newname string) error {
 }
 
 func (s S3Fs) Stat(name string) (os.FileInfo, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.source.Stat(name)
 }
 
 func (s S3Fs) Name() string {
