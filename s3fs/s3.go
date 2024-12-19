@@ -65,8 +65,7 @@ func (s S3Fs) Open(name string) (afero.File, error) {
 }
 
 func (s S3Fs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
-	//TODO implement me
-	panic("implement me")
+	return s.source.OpenFile(name, flag, perm)
 }
 
 func (s S3Fs) Remove(name string) error {
@@ -88,21 +87,17 @@ func (s S3Fs) Stat(name string) (os.FileInfo, error) {
 }
 
 func (s S3Fs) Name() string {
-	//TODO implement me
-	panic("implement me")
+	return "s3Fs"
 }
 
 func (s S3Fs) Chmod(name string, mode os.FileMode) error {
-	//TODO implement me
-	panic("implement me")
+	panic("not implemented")
 }
 
 func (s S3Fs) Chown(name string, uid, gid int) error {
-	//TODO implement me
-	panic("implement me")
+	panic("not implemented")
 }
 
 func (s S3Fs) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	//TODO implement me
-	panic("implement me")
+	panic("not implemented")
 }

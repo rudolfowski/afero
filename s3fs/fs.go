@@ -33,10 +33,11 @@ type ObjectAttrs struct {
 }
 
 type fs struct {
-	ctx      context.Context
-	client   *s3.Client
-	uploader *manager.Uploader
-	log      *slog.Logger
+	ctx        context.Context
+	client     *s3.Client
+	uploader   *manager.Uploader
+	downloader *manager.Downloader
+	log        *slog.Logger
 
 	separator string
 	limit     int32
@@ -45,9 +46,15 @@ type fs struct {
 func newFs(ctx context.Context, client *s3.Client) *fs {
 
 	return &fs{
-		ctx:       ctx,
-		client:    client,
-		uploader:  manager.NewUploader(client),
+		ctx:    ctx,
+		client: client,
+		uploader: manager.NewUploader(client, func(u *manager.Uploader) {
+			u.PartSize = 10 * 1024 * 1024
+		}),
+		downloader: manager.NewDownloader(client, func(d *manager.Downloader) {
+			d.Concurrency = 1
+			d.PartSize = 10 * 1024 * 1024
+		}),
 		separator: "/",
 		limit:     1000,
 	}
@@ -310,16 +317,19 @@ func (f *fs) uploadObject(name string, body io.Reader) (*manager.UploadOutput, e
 
 	return out, nil
 }
-func (f *fs) downloadObject(name string) (*s3.GetObjectOutput, error) {
+func (f *fs) DownloadObject(name string, w io.WriterAt, opts ...func(d *manager.Downloader)) (int64, error) {
 	bucketName, key := SplitName(name, f.separator)
-	out, err := f.client.GetObject(f.ctx, &s3.GetObjectInput{
+
+	params := &s3.GetObjectInput{
 		Bucket: &bucketName,
 		Key:    &key,
-	})
-	if err != nil {
-		return nil, err
 	}
-	return out, nil
+	n, err := f.downloader.Download(f.ctx, w, params, opts...)
+	if err != nil {
+		return 0, err
+	}
+
+	return n, nil
 }
 
 func (f *fs) deleteObject(name string) error {

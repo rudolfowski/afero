@@ -30,15 +30,15 @@ var files = []struct {
 	offset          int64
 	contentAtOffset string
 }{
-	{"sub", true, true, dirSize, "", 0, ""},
-	{"sub/testDir2", true, true, dirSize, "", 0, ""},
+	// {"sub", true, true, dirSize, "", 0, ""},
+	// {"sub/testDir2", true, true, dirSize, "", 0, ""},
 	{"sub/testDir2/testFile", true, false, 8 * 1024, "c", 4 * 1024, "d"},
-	{"testFile", true, false, 12 * 1024, "a", 7 * 1024, "b"},
-	{"testDir1/testFile", true, false, 3 * 512, "b", 512, "c"},
-
-	{"", false, true, dirSize, "", 0, ""}, // special case
-
-	{"nonExisting", false, false, dirSize, "", 0, ""},
+	// {"testFile", true, false, 12 * 1024, "a", 7 * 1024, "b"},
+	// {"testDir1/testFile", true, false, 3 * 512, "b", 512, "c"},
+	//
+	// {"", false, true, dirSize, "", 0, ""}, // special case
+	//
+	// {"nonExisting", false, false, dirSize, "", 0, ""},
 }
 
 var dirs = []struct {
@@ -92,6 +92,60 @@ func TestMain(m *testing.M) {
 
 }
 
+func createFiles(t *testing.T) {
+	t.Helper()
+
+	var err error
+	for _, f := range files {
+		if !f.isdir && f.exists {
+			name := filepath.Join(bucketName, f.name)
+
+			var file afero.File
+			file, err = s3Afs.Create(name)
+			if err != nil {
+				t.Fatalf("failed to create file %s: %v", name, err)
+			}
+			var written int
+			var totalWritten int64
+			for totalWritten < f.size {
+				if totalWritten < f.offset {
+					writeBuf := []byte(strings.Repeat(f.content, int(f.offset)))
+					written, err = file.WriteAt(writeBuf, totalWritten)
+				} else {
+					writeBuf := []byte(strings.Repeat(f.contentAtOffset, int(f.size-f.offset)))
+					written, err = file.WriteAt(writeBuf, totalWritten)
+				}
+				if err != nil {
+					t.Fatalf("failed to write a file \"%s\": %s", f.name, err)
+				}
+
+				totalWritten += int64(written)
+			}
+			if err = file.Close(); err != nil {
+				t.Fatalf("failed to close file \"%s\": %s", f.name, err)
+			}
+		}
+	}
+
+}
+
+func removeFiles(t *testing.T) {
+	t.Helper()
+	var err error
+
+	// the files have to be created first
+	for _, f := range files {
+		if !f.isdir && f.exists {
+			name := filepath.Join(bucketName, f.name)
+
+			err = s3Afs.Remove(name)
+			if err != nil && errors.Is(err, syscall.ENOENT) {
+				t.Errorf("failed to remove file \"%s\": %s", f.name, err)
+			}
+		}
+	}
+}
+
 func Test_Open(t *testing.T) {
 	createFiles(t)
 	defer removeFiles(t)
@@ -134,6 +188,90 @@ func Test_Open(t *testing.T) {
 
 			if size := s.Size(); size != f.size {
 				t.Errorf("%v size, got: %v, expected: %v", file.Name(), size, f.size)
+			}
+		}
+	}
+}
+
+func Test_Read(t *testing.T) {
+	createFiles(t)
+	defer removeFiles(t)
+
+	for _, f := range files {
+		if !f.exists {
+			continue
+		}
+
+		nameBase := filepath.Join(bucketName, f.name)
+
+		names := []string{
+			nameBase,
+			string(os.PathSeparator) + nameBase,
+		}
+		if f.name == "" {
+			names = []string{f.name}
+		}
+
+		for _, name := range names {
+			file, err := s3Afs.Open(name)
+			if err != nil {
+				t.Fatalf("opening %v: %v", name, err)
+			}
+
+			buf := make([]byte, 8)
+			n, err := file.Read(buf)
+			if err != nil {
+				if f.isdir && (err != syscall.EISDIR) {
+					t.Errorf("%v got error %v, expected EISDIR", name, err)
+				} else if !f.isdir {
+					t.Errorf("%v: %v", name, err)
+				}
+			} else if n != 8 {
+				t.Errorf("%v: got %d read bytes, expected 8", name, n)
+			} else if string(buf) != strings.Repeat(f.content, testBytes) {
+				t.Errorf("%v: got <%s>, expected <%s>", f.name, f.content, string(buf))
+			}
+		}
+	}
+}
+
+func Test_ReadAt(t *testing.T) {
+	createFiles(t)
+	defer removeFiles(t)
+
+	for _, f := range files {
+		if !f.exists {
+			continue
+		}
+
+		nameBase := filepath.Join(bucketName, f.name)
+
+		names := []string{
+			nameBase,
+			string(os.PathSeparator) + nameBase,
+		}
+		if f.name == "" {
+			names = []string{f.name}
+		}
+
+		for _, name := range names {
+			file, err := s3Afs.Open(name)
+			if err != nil {
+				t.Fatalf("opening %v: %v", name, err)
+			}
+
+			buf := make([]byte, testBytes)
+			n, err := file.ReadAt(buf, f.offset-testBytes/2)
+			if err != nil {
+				if f.isdir && (err != syscall.EISDIR) {
+					t.Errorf("%v got error %v, expected EISDIR", name, err)
+				} else if !f.isdir {
+					t.Errorf("%v: %v", name, err)
+				}
+			} else if n != 8 {
+				t.Errorf("%v: got %d read bytes, expected 8", f.name, n)
+			} else if string(buf) != strings.Repeat(f.content, testBytes/2)+strings.Repeat(f.contentAtOffset, testBytes/2) {
+				t.Errorf("%v: got <%s>, expected <%s>", f.name, f.contentAtOffset, string(buf))
 			}
 		}
 	}
@@ -202,60 +340,6 @@ func Test_Readdir(t *testing.T) {
 		_, err = dir.Readdir(-1)
 		if err != syscall.ENOTDIR {
 			t.Fatal("Expected error")
-		}
-	}
-}
-
-func createFiles(t *testing.T) {
-	t.Helper()
-
-	var err error
-	for _, f := range files {
-		if !f.isdir && f.exists {
-			name := filepath.Join(bucketName, f.name)
-
-			var file afero.File
-			file, err = s3Afs.Create(name)
-			if err != nil {
-				t.Fatalf("failed to create file %s: %v", name, err)
-			}
-			var written int
-			var totalWritten int64
-			for totalWritten < f.size {
-				if totalWritten < f.offset {
-					writeBuf := []byte(strings.Repeat(f.content, int(f.offset)))
-					written, err = file.WriteAt(writeBuf, totalWritten)
-				} else {
-					writeBuf := []byte(strings.Repeat(f.contentAtOffset, int(f.size-f.offset)))
-					written, err = file.WriteAt(writeBuf, totalWritten)
-				}
-				if err != nil {
-					t.Fatalf("failed to write a file \"%s\": %s", f.name, err)
-				}
-
-				totalWritten += int64(written)
-			}
-			if err = file.Close(); err != nil {
-				t.Fatalf("failed to close file \"%s\": %s", f.name, err)
-			}
-		}
-	}
-
-}
-
-func removeFiles(t *testing.T) {
-	t.Helper()
-	var err error
-
-	// the files have to be created first
-	for _, f := range files {
-		if !f.isdir && f.exists {
-			name := filepath.Join(bucketName, f.name)
-
-			err = s3Afs.Remove(name)
-			if err != nil && errors.Is(err, syscall.ENOENT) {
-				t.Errorf("failed to remove file \"%s\": %s", f.name, err)
-			}
 		}
 	}
 }

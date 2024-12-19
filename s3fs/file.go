@@ -1,6 +1,7 @@
 package s3fs
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -10,12 +11,41 @@ import (
 	"syscall"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/spf13/afero"
 )
 
 var (
 	ErrFileReadonly = errors.New("file is readonly")
 )
+
+// DummyWriterAt is a dummy implementation of io.WriterAt
+// It writes data do a buffer and then to the writer
+// It can be used only with s3 downloader with 1 concurrency
+type DummyWriterAt struct {
+	w      io.Writer
+	offset int64
+	buf    []byte
+	l      int64
+}
+
+func (dw *DummyWriterAt) WriteAt(p []byte, offset int64) (int, error) {
+	result := p
+	pLen := len(result)
+
+	return pLen, nil
+}
+
+func (dw *DummyWriterAt) Bytes() []byte {
+	return dw.buf
+}
+
+func newDummyWriterAt(buf []byte, offset int64) *DummyWriterAt {
+	return &DummyWriterAt{
+		offset: offset,
+		buf:    buf,
+	}
+}
 
 var _ io.WriteCloser = (*writer)(nil)
 
@@ -87,6 +117,81 @@ func (w *writer) Close() error {
 		}
 		return err
 	}
+	return nil
+}
+
+var _ io.ReadCloser = (*reader)(nil)
+
+type reader struct {
+	fs *fs
+
+	name        string
+	offset      int64
+	buf         []byte
+	currentSize int64
+	pos         int64
+
+	wg sync.WaitGroup
+
+	r io.ReadCloser
+}
+
+func newReader(fs *fs, name string, offset int64, size int64) *reader {
+	return &reader{
+		fs:     fs,
+		name:   name,
+		offset: offset,
+		buf:    make([]byte, size-offset),
+	}
+}
+
+func (r *reader) open() error {
+	_, err := r.fs.DownloadObject(r.name, r)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *reader) WriteAt(p []byte, _ int64) (int, error) {
+
+	l := len(p)
+	size := r.currentSize
+	pLen := int64(l)
+	expLen := size + pLen
+	var pos int64
+	if expLen > r.offset {
+		diff := expLen - r.offset
+		var buff []byte
+		if diff >= pLen {
+			buff = p
+			pos = pLen
+		} else {
+			pos = pLen - diff
+			buff = p[pos:]
+		}
+
+		copy(r.buf, buff)
+		r.pos += pos
+	}
+
+	r.currentSize += pLen
+	return l, nil
+
+}
+
+func (r *reader) Read(p []byte) (n int, err error) {
+	if r.r == nil {
+		if err := r.open(); err != nil {
+			return 0, err
+		}
+	}
+
+	return r.r.Read(p)
+}
+
+func (r *reader) Close() error {
+
 	return nil
 }
 
@@ -188,16 +293,14 @@ func (f *S3File) WriteAt(p []byte, off int64) (int, error) {
 		// we need to read the object and write it to the pipe
 		// until the offset
 		// then we can write the new data
-		r, err := f.fs.downloadObject(f.name)
+		buffer := manager.NewWriteAtBuffer([]byte{})
+		_, err := f.fs.DownloadObject(f.name, buffer)
 		if err != nil {
 			return 0, err
 		}
 
-		_, err = io.CopyN(w, r.Body, off)
+		_, err = io.CopyN(w, bytes.NewBuffer(buffer.Bytes()), off)
 		if err != nil {
-			return 0, err
-		}
-		if err := r.Body.Close(); err != nil {
 			return 0, err
 		}
 	}
@@ -212,13 +315,71 @@ func (f *S3File) WriteAt(p []byte, off int64) (int, error) {
 
 }
 func (f *S3File) Read(p []byte) (n int, err error) {
-	//TODO implement me
-	panic("implement me")
+	return f.ReadAt(p, f.offset)
 }
 
+// ReadAt reads len(p) bytes into p starting at the offset
+// Reading when offset is greater than 0 its not supported in the s3
+// so we have to download the object
+// its very costly operation on large files if we have to read not from the beginning
 func (f *S3File) ReadAt(p []byte, off int64) (n int, err error) {
-	//TODO implement me
-	panic("implement me")
+	if f.closed {
+		return 0, afero.ErrFileClosed
+	}
+
+	if cap(p) == 0 {
+		return 0, nil
+	}
+
+	// if the offset is the same as the current offset and the reader is not nil
+	// we can read directly from the reader
+	if off == f.offset && f.reader != nil {
+		return f.reader.Read(p)
+	}
+
+	// we have to check if its not a directory
+	if f.reader == nil && f.writer == nil {
+		fi, err := f.Stat()
+		if err != nil {
+			return 0, err
+		}
+
+		if fi.IsDir() {
+			return 0, syscall.EISDIR
+		}
+	}
+
+	// if writers are open, close them
+	// same for readers if they are open on different offsets
+	if err = f.closeIo(); err != nil {
+		return 0, err
+	}
+
+	// get the object attributes
+	// we need to know the size of the object
+	currentSize := int64(0)
+	h, err := f.fs.getObj(f.name)
+	if err != nil {
+		if off > 0 {
+			return 0, err
+		}
+	}
+
+	currentSize = aws.ToInt64(h.ContentLength)
+
+	if off > currentSize {
+		return 0, afero.ErrOutOfRange
+	}
+
+	r := newReader(f.fs, f.name, off, currentSize)
+
+	f.reader = r
+	f.offset = off
+
+	read, err := r.Read(p)
+	f.offset += int64(read)
+	return read, err
+
 }
 
 func (f *S3File) Seek(offset int64, whence int) (int64, error) {
@@ -262,7 +423,7 @@ func (f *S3File) Readdir(count int) ([]os.FileInfo, error) {
 		return res, io.EOF
 	}
 
-	for _, attr  := range attrs {
+	for _, attr := range attrs {
 		fileInfos = append(fileInfos, newFileInfoFromAttrs(attr, f.fs, DefaultFileMode))
 	}
 
