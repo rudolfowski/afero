@@ -1,3 +1,8 @@
+// Description: S3 file system implementation
+// The S3 file system implementation is a wrapper around the S3 client from the AWS SDK for Go V2.
+// It implements the afero.Fs interface.
+// I inspired from the GCS file system implementation in the afero library.
+
 package s3fs
 
 import (
@@ -73,13 +78,11 @@ func (s S3Fs) Remove(name string) error {
 }
 
 func (s S3Fs) RemoveAll(path string) error {
-	//TODO implement me
-	panic("implement me")
+	return s.source.RemoveAll(path)
 }
 
 func (s S3Fs) Rename(oldname, newname string) error {
-	//TODO implement me
-	panic("implement me")
+	return s.source.Rename(oldname, newname)
 }
 
 func (s S3Fs) Stat(name string) (os.FileInfo, error) {

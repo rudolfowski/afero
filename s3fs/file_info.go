@@ -8,14 +8,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
+	"github.com/spf13/afero"
 )
 
 const folderSize = 42
 
 var _ os.FileInfo = (*FileInfo)(nil)
-
 
 type FileInfo struct {
 	name     string
@@ -45,27 +43,24 @@ func newFileInfo(name string, fs *fs, fileMode os.FileMode) (*FileInfo, error) {
 			return fi, nil
 		}
 
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) {
-			switch apiErr.(type) {
-			case *types.NotFound:
+		if errors.Is(err, afero.ErrFileNotFound) {
 
-				// S3 doesn't have a concept of directories
-				// so we check if the object is empty and has a trailing separator
-				// to determine if it's a directory
-				ok, err := fs.checkIfDirExists(name)
-				if err != nil {
-					return nil, err
-				}
-
-				if ok {
-					fi.isDir = true
-					fi.size = folderSize
-					fi.name = EnsureTrailingSeparator(fi.name, fs.separator)
-					return fi, nil
-				}
-
+			// S3 doesn't have a concept of directories
+			// so we check if the object is empty and has a trailing separator
+			// to determine if it's a directory
+			ok, err := fs.checkIfDirExists(name)
+			if err != nil {
+				return nil, err
 			}
+
+			if ok {
+				fi.isDir = true
+				fi.size = folderSize
+				fi.name = EnsureTrailingSeparator(fi.name, fs.separator)
+				return fi, nil
+			}
+			return nil, afero.ErrFileNotFound
+
 		}
 
 		return nil, err
@@ -87,7 +82,7 @@ func newFileInfoFromAttrs(attrs ObjectAttrs, fs *fs, fileMode os.FileMode) *File
 		isDir:    false,
 	}
 
-	if attrs.Key == "" && attrs.Prefix != "" {
+	if attrs.IsDir {
 		fi.isDir = true
 		fi.size = folderSize
 		fi.name = EnsureTrailingSeparator(fi.name, fs.separator)

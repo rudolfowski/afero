@@ -5,16 +5,16 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/spf13/afero"
 )
 
@@ -29,7 +29,7 @@ type ObjectAttrs struct {
 	Key          string
 	Size         int64
 	LastModified time.Time
-	Prefix       string
+	IsDir        bool
 }
 
 type fs struct {
@@ -151,7 +151,7 @@ func (f *fs) Create(name string) (*S3File, error) {
 		return nil, err
 	}
 
-	return newS3File(f, name), nil
+	return newS3File(f, name, os.O_CREATE), nil
 
 }
 
@@ -165,7 +165,7 @@ func (f *fs) OpenFile(name string, flag int, perm os.FileMode) (*S3File, error) 
 		return nil, err
 	}
 
-	file := newS3File(f, name)
+	file := newS3File(f, name, flag)
 	if flag == os.O_RDONLY {
 		// we just want to read the file
 		// so we get file info to check if the file exists
@@ -200,7 +200,7 @@ func (f *fs) OpenFile(name string, flag int, perm os.FileMode) (*S3File, error) 
 		_, err = file.Stat()
 		if err == nil {
 			// the file actually exists
-			return nil, afero.ErrFileExists
+			return nil, syscall.EPERM
 		}
 
 		if _, err = file.WriteString(""); err != nil {
@@ -229,7 +229,7 @@ func (f *fs) Remove(name string) error {
 		}
 
 		infos, err := dir.Readdir(-1)
-		if err != nil {
+		if err != nil && err != io.EOF {
 			return err
 		}
 
@@ -243,8 +243,75 @@ func (f *fs) Remove(name string) error {
 	return f.deleteObject(name)
 }
 
+func (f *fs) RemoveAll(path string) error {
+	path, err := f.parseName(path)
+	if err != nil {
+		return err
+	}
+
+	fi, err := f.Stat(path)
+	if err != nil {
+		// if the path doesn't exist we just return nil
+		if errors.Is(err, afero.ErrFileNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	// if it's a file we just remove it
+	if !fi.IsDir() {
+		return f.Remove(path)
+	}
+
+	dir, err := f.Open(path)
+	if err != nil {
+		return err
+	}
+
+	infos, err := dir.Readdir(-1)
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	for _, info := range infos {
+		err = f.RemoveAll(path + f.separator + info.Name())
+		if err != nil {
+			return err
+		}
+	}
+
+	return f.Remove(path)
+}
+
 func (f *fs) Rename(oldname, newname string) error {
-	return nil
+	oldname, err := f.parseName(oldname)
+	if err != nil {
+		return err
+	}
+
+	newname, err = f.parseName(newname)
+	if err != nil {
+		return err
+	}
+
+	_, err = f.getObj(oldname)
+	if err != nil {
+		return err
+	}
+
+	_, err = f.getObj(newname)
+	if err != nil {
+		if !errors.Is(err, afero.ErrFileNotFound) {
+			return err
+		}
+	}
+
+	err = f.copyObject(oldname, newname)
+	if err != nil {
+		return err
+	}
+
+	return f.deleteObject(oldname)
 }
 
 func (f *fs) Stat(name string) (os.FileInfo, error) {
@@ -280,6 +347,13 @@ func (f *fs) getObj(name string) (*s3.HeadObjectOutput, error) {
 		Key:    &key,
 	})
 	if err != nil {
+		var apiError smithy.APIError
+		if errors.As(err, &apiError) {
+			switch apiError.(type) {
+			case *types.NotFound:
+				err = afero.ErrFileNotFound
+			}
+		}
 		return nil, err
 	}
 	return out, nil
@@ -317,6 +391,30 @@ func (f *fs) uploadObject(name string, body io.Reader) (*manager.UploadOutput, e
 
 	return out, nil
 }
+
+func (f *fs) copyObject(source string, dest string) error {
+	destBucket, destKey := SplitName(dest, f.separator)
+	_, err := f.client.CopyObject(f.ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(destBucket),
+		CopySource: aws.String(source),
+		Key:        aws.String(destKey),
+	})
+	if err != nil {
+		return err
+	} else {
+		err := s3.NewObjectExistsWaiter(f.client).Wait(f.ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(destBucket),
+			Key:    aws.String(destKey),
+		}, time.Minute)
+
+		if err != nil {
+			f.log.Error("Failed attempt to wait for object %s to exist in %s.\n", destKey, destBucket)
+		}
+	}
+
+	return nil
+}
+
 func (f *fs) DownloadObject(name string, w io.WriterAt, opts ...func(d *manager.Downloader)) (int64, error) {
 	bucketName, key := SplitName(name, f.separator)
 
@@ -346,8 +444,7 @@ func (f *fs) deleteObject(name string) error {
 
 func (f *fs) isObjectExist(name string) (bool, error) {
 	if _, err := f.getObj(name); err != nil {
-		var responseError *awshttp.ResponseError
-		if errors.As(err, &responseError) && responseError.ResponseError.HTTPStatusCode() == http.StatusNotFound {
+		if errors.Is(err, afero.ErrFileNotFound) {
 			return false, nil
 		}
 		return false, err
@@ -405,13 +502,17 @@ func (f *fs) getObjectsAttrs(name string) ([]ObjectAttrs, error) {
 
 		dirs := page.CommonPrefixes
 		for _, dir := range dirs {
+			dirKey := strings.TrimPrefix(aws.ToString(dir.Prefix), key)
 			objects = append(objects, ObjectAttrs{
-				Key:    *dir.Prefix,
-				Prefix: *dir.Prefix,
+				Key:   dirKey,
+				IsDir: true,
 			})
 		}
 
 		for _, obj := range page.Contents {
+			if *obj.Key == key {
+				continue
+			}
 			objects = append(objects, ObjectAttrs{
 				Key:          *obj.Key,
 				Size:         *obj.Size,
