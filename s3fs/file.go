@@ -50,7 +50,7 @@ func newDummyWriterAt(buf []byte, offset int64) *DummyWriterAt {
 var _ io.WriteCloser = (*writer)(nil)
 
 type writer struct {
-	fs   *fs
+	fs   *Fs
 	name string
 	w    *io.PipeWriter
 	r    *io.PipeReader
@@ -59,7 +59,7 @@ type writer struct {
 	err error
 }
 
-func newWriter(fs *fs, name string) *writer {
+func newWriter(fs *Fs, name string) *writer {
 	return &writer{
 		fs:   fs,
 		wg:   sync.WaitGroup{},
@@ -123,7 +123,7 @@ func (w *writer) Close() error {
 var _ io.ReadCloser = (*reader)(nil)
 
 type reader struct {
-	fs *fs
+	fs *Fs
 
 	name        string
 	offset      int64
@@ -138,7 +138,7 @@ type reader struct {
 	err error
 }
 
-func newReader(fs *fs, name string, offset int64, size int64) *reader {
+func newReader(fs *Fs, name string, offset int64, size int64) *reader {
 	return &reader{
 		fs:     fs,
 		name:   name,
@@ -252,7 +252,7 @@ func (r *reader) Close() error {
 var _ afero.File = (*S3File)(nil)
 
 type S3File struct {
-	fs     *fs
+	fs     *Fs
 	name   string
 	closed bool
 
@@ -265,7 +265,7 @@ type S3File struct {
 	reader io.ReadCloser
 }
 
-func newS3File(fs *fs, name string, flags int) *S3File {
+func newS3File(fs *Fs, name string, flags int) *S3File {
 	return &S3File{
 		fs:     fs,
 		name:   name,

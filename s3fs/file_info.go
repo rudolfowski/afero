@@ -23,7 +23,7 @@ type FileInfo struct {
 	fileMode os.FileMode
 }
 
-func newFileInfo(name string, fs *fs, fileMode os.FileMode) (*FileInfo, error) {
+func newFileInfo(name string, fs *Fs, fileMode os.FileMode) (*FileInfo, error) {
 	fi := &FileInfo{
 		name:     name,
 		fileMode: fileMode,
@@ -34,6 +34,13 @@ func newFileInfo(name string, fs *fs, fileMode os.FileMode) (*FileInfo, error) {
 
 	obj, err := fs.getObj(name)
 	if err != nil {
+		// If the bucket name is empty, it's a root folder
+		if errors.Is(err, ErrorNoBucketName) {
+			fi.isDir = true
+			fi.size = folderSize
+			fi.name = EnsureTrailingSeparator(fi.name, fs.separator)
+			return fi, nil
+		}
 		// If the object key is empty, it's a root folder
 		// because getObj first check bucket and when find the bucket check key
 		if errors.Is(err, ErrEmptyObjectKey) {
@@ -73,7 +80,7 @@ func newFileInfo(name string, fs *fs, fileMode os.FileMode) (*FileInfo, error) {
 
 }
 
-func newFileInfoFromAttrs(attrs ObjectAttrs, fs *fs, fileMode os.FileMode) *FileInfo {
+func newFileInfoFromAttrs(attrs ObjectAttrs, fs *Fs, fileMode os.FileMode) *FileInfo {
 	fi := &FileInfo{
 		name:     attrs.Key,
 		size:     attrs.Size,

@@ -197,6 +197,31 @@ func Test_Open(t *testing.T) {
 	}
 }
 
+func Test_OpenRoot(t *testing.T) {
+	file, err := s3Afs.Open("/")
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+
+	s, err := file.Stat()
+	if err != nil {
+		t.Fatalf("stat root: %v", err)
+	}
+
+	if !s.IsDir() {
+		t.Fatal("root is not a directory")
+	}
+
+	names, err := file.Readdirnames(-1)
+	if err != nil {
+		t.Fatalf("readdirnames root: %v", err)
+	}
+
+	if len(names) == 0 {
+		t.Fatal("root has no children")
+	}
+}
+
 func Test_Read(t *testing.T) {
 	createFiles(t)
 	defer removeFiles(t)
@@ -828,6 +853,7 @@ func Test_Truncate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create a file %s: %v", file, err)
 	}
+	defer f.Close()
 	defer s3Afs.RemoveAll(bucketName)
 
 	_, err = f.Write([]byte("test"))

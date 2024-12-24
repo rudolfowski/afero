@@ -18,6 +18,24 @@ import (
 	"github.com/spf13/afero"
 )
 
+type FSConfig struct {
+	AwsConfig aws.Config
+
+	DownloadPartSize *int64
+	UploadPartSize   *int64
+
+	// The maximum number of objects to return
+	Limit *int32
+}
+
+func DefaultFSConfig() FSConfig {
+	return FSConfig{
+		DownloadPartSize: aws.Int64(0 * 1024 * 1024),
+		UploadPartSize:   aws.Int64(0 * 1024 * 1024),
+		Limit:            aws.Int32(1000),
+	}
+}
+
 var (
 	ErrorNoBucketName = errors.New("no bucket name")
 	ErrFilenameEmpty  = errors.New("filename is empty")
@@ -32,7 +50,7 @@ type ObjectAttrs struct {
 	IsDir        bool
 }
 
-type fs struct {
+type Fs struct {
 	ctx        context.Context
 	client     *s3.Client
 	uploader   *manager.Uploader
@@ -43,27 +61,39 @@ type fs struct {
 	limit     int32
 }
 
-func newFs(ctx context.Context, client *s3.Client) *fs {
+func newFs(ctx context.Context, client *s3.Client, conf FSConfig) *Fs {
+	c := DefaultFSConfig()
+	if conf.DownloadPartSize != nil {
+		c.DownloadPartSize = conf.DownloadPartSize
+	}
 
-	return &fs{
+	if conf.UploadPartSize != nil {
+		c.UploadPartSize = conf.UploadPartSize
+	}
+
+	if conf.Limit != nil {
+		c.Limit = conf.Limit
+	}
+
+	return &Fs{
 		ctx:    ctx,
 		client: client,
 		uploader: manager.NewUploader(client, func(u *manager.Uploader) {
-			u.PartSize = 10 * 1024 * 1024
+			u.PartSize = aws.ToInt64(c.UploadPartSize)
 		}),
 		downloader: manager.NewDownloader(client, func(d *manager.Downloader) {
 			d.Concurrency = 1
-			d.PartSize = 10 * 1024 * 1024
+			d.PartSize = aws.ToInt64(c.DownloadPartSize)
 		}),
 		separator: "/",
-		limit:     1000,
+		limit:     aws.ToInt32(c.Limit),
 	}
 }
 
 // S3 don't have a concept of directories
 // so we have to create a virtual directory
 // by creating an empty object with a trailing separator
-func (f *fs) Mkdir(name string, perm os.FileMode) error {
+func (f *Fs) Mkdir(name string, perm os.FileMode) error {
 	name, err := f.parseName(name)
 	if err != nil {
 		return err
@@ -94,7 +124,7 @@ func (f *fs) Mkdir(name string, perm os.FileMode) error {
 	return nil
 }
 
-func (f *fs) MkdirAll(path string, perm os.FileMode) error {
+func (f *Fs) MkdirAll(path string, perm os.FileMode) error {
 	path, err := f.parseName(path)
 	if err != nil {
 		return err
@@ -131,7 +161,7 @@ func (f *fs) MkdirAll(path string, perm os.FileMode) error {
 	return nil
 }
 
-func (f *fs) Create(name string) (*S3File, error) {
+func (f *Fs) Create(name string) (*S3File, error) {
 	name, err := f.parseName(name)
 	if err != nil {
 		return nil, err
@@ -155,11 +185,11 @@ func (f *fs) Create(name string) (*S3File, error) {
 
 }
 
-func (f *fs) Open(name string) (*S3File, error) {
+func (f *Fs) Open(name string) (*S3File, error) {
 	return f.OpenFile(name, os.O_RDONLY, 0)
 }
 
-func (f *fs) OpenFile(name string, flag int, perm os.FileMode) (*S3File, error) {
+func (f *Fs) OpenFile(name string, flag int, perm os.FileMode) (*S3File, error) {
 	name, err := f.parseName(name)
 	if err != nil {
 		return nil, err
@@ -210,7 +240,7 @@ func (f *fs) OpenFile(name string, flag int, perm os.FileMode) (*S3File, error) 
 	return file, nil
 }
 
-func (f *fs) Remove(name string) error {
+func (f *Fs) Remove(name string) error {
 	name, err := f.parseName(name)
 	if err != nil {
 		return err
@@ -243,7 +273,7 @@ func (f *fs) Remove(name string) error {
 	return f.deleteObject(name)
 }
 
-func (f *fs) RemoveAll(path string) error {
+func (f *Fs) RemoveAll(path string) error {
 	path, err := f.parseName(path)
 	if err != nil {
 		return err
@@ -283,7 +313,7 @@ func (f *fs) RemoveAll(path string) error {
 	return f.Remove(path)
 }
 
-func (f *fs) Rename(oldname, newname string) error {
+func (f *Fs) Rename(oldname, newname string) error {
 	oldname, err := f.parseName(oldname)
 	if err != nil {
 		return err
@@ -314,7 +344,7 @@ func (f *fs) Rename(oldname, newname string) error {
 	return f.deleteObject(oldname)
 }
 
-func (f *fs) Stat(name string) (os.FileInfo, error) {
+func (f *Fs) Stat(name string) (os.FileInfo, error) {
 	name, err := f.parseName(name)
 	if err != nil {
 		return nil, err
@@ -323,7 +353,7 @@ func (f *fs) Stat(name string) (os.FileInfo, error) {
 	return newFileInfo(name, f, DefaultFileMode)
 }
 
-func (f *fs) parseName(name string) (string, error) {
+func (f *Fs) parseName(name string) (string, error) {
 	if name == "" {
 		return "", ErrFilenameEmpty
 	}
@@ -331,8 +361,14 @@ func (f *fs) parseName(name string) (string, error) {
 	return NoLeadingSeparator(NormalizeSeparators(name, s), s), nil
 }
 
-func (f *fs) getObj(name string) (*s3.HeadObjectOutput, error) {
+func (f *Fs) getObj(name string) (*s3.HeadObjectOutput, error) {
 	bucketName, key := SplitName(name, f.separator)
+
+	// if bucket name is empty we return error
+	if bucketName == "" {
+		return nil, ErrorNoBucketName
+	}
+
 	_, err := f.getBucket(bucketName)
 	if err != nil {
 		return nil, err
@@ -359,7 +395,7 @@ func (f *fs) getObj(name string) (*s3.HeadObjectOutput, error) {
 	return out, nil
 }
 
-func (f *fs) getBucket(name string) (*s3.HeadBucketOutput, error) {
+func (f *Fs) getBucket(name string) (*s3.HeadBucketOutput, error) {
 	out, err := f.client.HeadBucket(f.ctx, &s3.HeadBucketInput{
 		Bucket: &name,
 	})
@@ -369,7 +405,21 @@ func (f *fs) getBucket(name string) (*s3.HeadBucketOutput, error) {
 	return out, nil
 }
 
-func (f *fs) uploadObject(name string, body io.Reader) (*manager.UploadOutput, error) {
+func (f *Fs) getBuckets() ([]string, error) {
+	out, err := f.client.ListBuckets(f.ctx, &s3.ListBucketsInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	var buckets []string
+	for _, bucket := range out.Buckets {
+		buckets = append(buckets, *bucket.Name)
+	}
+
+	return buckets, nil
+}
+
+func (f *Fs) uploadObject(name string, body io.Reader) (*manager.UploadOutput, error) {
 	bucketName, key := SplitName(name, f.separator)
 	out, err := f.uploader.Upload(f.ctx, &s3.PutObjectInput{
 		Bucket: &bucketName,
@@ -392,7 +442,7 @@ func (f *fs) uploadObject(name string, body io.Reader) (*manager.UploadOutput, e
 	return out, nil
 }
 
-func (f *fs) copyObject(source string, dest string) error {
+func (f *Fs) copyObject(source string, dest string) error {
 	destBucket, destKey := SplitName(dest, f.separator)
 	_, err := f.client.CopyObject(f.ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(destBucket),
@@ -415,7 +465,7 @@ func (f *fs) copyObject(source string, dest string) error {
 	return nil
 }
 
-func (f *fs) DownloadObject(name string, w io.WriterAt, opts ...func(d *manager.Downloader)) (int64, error) {
+func (f *Fs) DownloadObject(name string, w io.WriterAt, opts ...func(d *manager.Downloader)) (int64, error) {
 	bucketName, key := SplitName(name, f.separator)
 
 	params := &s3.GetObjectInput{
@@ -430,7 +480,7 @@ func (f *fs) DownloadObject(name string, w io.WriterAt, opts ...func(d *manager.
 	return n, nil
 }
 
-func (f *fs) deleteObject(name string) error {
+func (f *Fs) deleteObject(name string) error {
 	bucketName, key := SplitName(name, f.separator)
 	_, err := f.client.DeleteObject(f.ctx, &s3.DeleteObjectInput{
 		Bucket: &bucketName,
@@ -442,7 +492,7 @@ func (f *fs) deleteObject(name string) error {
 	return nil
 }
 
-func (f *fs) isObjectExist(name string) (bool, error) {
+func (f *Fs) isObjectExist(name string) (bool, error) {
 	if _, err := f.getObj(name); err != nil {
 		if errors.Is(err, afero.ErrFileNotFound) {
 			return false, nil
@@ -452,7 +502,7 @@ func (f *fs) isObjectExist(name string) (bool, error) {
 	return true, nil
 }
 
-func (f *fs) checkIfDirExists(name string) (bool, error) {
+func (f *Fs) checkIfDirExists(name string) (bool, error) {
 	bucketName, key := SplitName(name, f.separator)
 	params := &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucketName),
@@ -481,8 +531,28 @@ func (f *fs) checkIfDirExists(name string) (bool, error) {
 	return false, nil
 }
 
-func (f *fs) getObjectsAttrs(name string) ([]ObjectAttrs, error) {
+func (f *Fs) getObjectsAttrs(name string) ([]ObjectAttrs, error) {
 	bucketName, key := SplitName(name, f.separator)
+
+	// if bucket name is empty we read all buckets
+	if bucketName == "" {
+
+		buckets, err := f.getBuckets()
+		if err != nil {
+			return nil, err
+		}
+
+		var objects []ObjectAttrs
+		for _, bucket := range buckets {
+			objects = append(objects, ObjectAttrs{
+				Key:   bucket,
+				IsDir: true,
+			})
+		}
+
+		return objects, nil
+	}
+
 	params := &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucketName),
 		Prefix:    aws.String(key),

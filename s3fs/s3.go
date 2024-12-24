@@ -16,10 +16,8 @@ import (
 	"github.com/spf13/afero"
 )
 
-var _ afero.Fs = (*S3Fs)(nil)
-
 type S3Fs struct {
-	source *fs
+	source *Fs
 }
 
 func NewS3FS(ctx context.Context, opts ...func(o *s3.Options)) (*S3Fs, error) {
@@ -38,18 +36,18 @@ func NewS3FS(ctx context.Context, opts ...func(o *s3.Options)) (*S3Fs, error) {
 		}
 	}
 
-	return NewS3FSWithConfig(ctx, cfg, opts...), nil
+	return NewS3FSWithConfig(ctx, FSConfig{AwsConfig: cfg}, opts...), nil
 }
 
-func NewS3FSWithConfig(ctx context.Context, cfg aws.Config, opts ...func(o *s3.Options)) *S3Fs {
-	client := s3.NewFromConfig(cfg, opts...)
+func NewS3FSWithConfig(ctx context.Context, cfg FSConfig, opts ...func(o *s3.Options)) *S3Fs {
+	client := s3.NewFromConfig(cfg.AwsConfig, opts...)
 
-	return &S3Fs{source: newFs(ctx, client)}
+	return &S3Fs{source: newFs(ctx, client, cfg)}
 }
 
-func NewS3FSWithClient(ctx context.Context, client *s3.Client) *S3Fs {
+func NewS3FSWithClient(ctx context.Context, client *s3.Client, cfg FSConfig) *S3Fs {
 	return &S3Fs{
-		source: newFs(ctx, client),
+		source: newFs(ctx, client, cfg),
 	}
 }
 
